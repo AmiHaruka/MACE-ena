@@ -64,3 +64,8 @@ htmlcov/
 
 # local planning docs (not for the public repo)
 /doc
+
+# for mace-ena
+/mace/modules/envhead/runs/
+/mace/modules/envhead/docs/
+/tests/extensions/envhead/

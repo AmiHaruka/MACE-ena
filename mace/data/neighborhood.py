@@ -59,11 +59,20 @@ def get_neighborhood(
     else:
         cell = extended_cell
 
+    # For a fully nonperiodic search, place a COPY inside the artificial cell.
+    # matscipy 1.2 can otherwise return image shifts for wrapped positions;
+    # pairing those shifts with the original coordinates corrupts edge vectors.
+    # A uniform translation preserves all displacements. Do not alter caller
+    # coordinates or the periodic / mixed-periodicity path.
+    search_positions = positions
+    if not any(pbc):
+        search_positions = positions - positions.min(axis=0)
+
     sender, receiver, unit_shifts = neighbour_list(
         quantities="ijS",
         pbc=pbc,
         cell=extended_cell,
-        positions=positions,
+        positions=search_positions,
         cutoff=cutoff,
         # self_interaction=True,  # we want edges from atom to itself in different periodic images
         # use_scaled_positions=False,  # positions are not scaled positions
