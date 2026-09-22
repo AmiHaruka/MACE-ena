@@ -1,306 +1,214 @@
-"""Eager EnvMACE: exact cloned foundation, explicit pre-product feature tap."""
+"""EnvHead v2: single foundation pass with environment-conditioned messages."""
+
 from copy import deepcopy
-
 import torch
-
-from mace.modules.models import ScaleShiftMACE
-from mace.modules.utils import prepare_graph, compute_hessians_vmap
-
-from ..adapters import foundation_adapter
+from e3nn import o3
+from mace.modules.models import MACE, ScaleShiftMACE
+from mace.modules.extensions import MACELES
 from .config import EnvHeadConfig
-from .head import EnvHead
+from .graph import build_graph
+from .encoders import EnvironmentInteraction, GlobalEncoder, flatten_message, sum_nodes
+from .response import response_outputs
 
 
-class EnvMACE(ScaleShiftMACE):
-    def __getstate__(self):
-        state = super().__getstate__()
-        # Rebuild backend execution caches after copy/save/load; canonical model
-        # tensors and the explicit backend choice are sufficient.
-        state.pop("_cueq_foundation_cache", None)
-        state.pop("_cueq_head_cache", None)
-        return state
-
-    def _apply(self, fn, recurse=True):
-        self.__dict__.pop("_cueq_foundation_cache", None)
-        self.__dict__.pop("_cueq_head_cache", None)
-        return super()._apply(fn, recurse=recurse)
+class EnvMACE(torch.nn.Module):
+    format_version = 2
 
     def __init__(self, foundation, config=None, dtype=None):
-        source_dtype = next(foundation.parameters()).dtype
-        dtype = source_dtype if dtype is None else dtype
-        if source_dtype not in (torch.float32, torch.float64) or dtype not in (
-            torch.float32,
-            torch.float64,
-        ):
-            raise ValueError(
-                "EnvMACE supports float32/float64 foundations and computation"
-            )
-        if source_dtype == torch.float32 and dtype == torch.float64:
-            raise ValueError(
-                "A float32 foundation cannot be promoted to float64; use float32 or supply a float64 foundation"
-            )
-        adapter = foundation_adapter(foundation)
-        adapter.validate(foundation)
-        for module in foundation.modules():
-            for key in ("cueq_config", "oeq_config"):
-                backend = getattr(module, key, None)
-                if backend is not None and getattr(backend, "enabled", False):
-                    raise NotImplementedError("Accelerated backends are unsupported")
-        # Deepcopy preserves constructor-specific modules and metadata, including
-        # readouts and scale/shift. No foundation reconstruction or key filtering.
-        clone = deepcopy(foundation).to(dtype=dtype)
-        torch.nn.Module.__init__(self)
-        self.__dict__.update(clone.__dict__)
-        if not hasattr(self, "heads"):
-            self.heads = ["Default"]
-        for parameter in self.parameters():
-            parameter.requires_grad_(False)
-        self._envhead_adapter_name = adapter.name
-        self._envhead_active = False
-        interaction = adapter.interaction(self)
-        previous_dtype = torch.get_default_dtype()
-        try:
-            # Construct head constants in the same precision as the foundation.
-            torch.set_default_dtype(dtype)
-            self.env_head = EnvHead(
-                interaction.target_irreps,
-                interaction,
-                (config or EnvHeadConfig()),
-            ).to(device=self.r_max.device, dtype=dtype)
-        finally:
-            torch.set_default_dtype(previous_dtype)
+        super().__init__()
+        self.config = config or EnvHeadConfig()
+        if type(foundation) not in (MACE, ScaleShiftMACE, MACELES):
+            raise TypeError("v2 supports native MACE, ScaleShiftMACE and MACELES")
+        if len(getattr(foundation, "heads", ["Default"])) != 1:
+            raise ValueError("v2 requires a single foundation energy head")
+        self.foundation = deepcopy(foundation)
+        dtype = dtype or next(foundation.parameters()).dtype
+        self.foundation.to(dtype=dtype)
+        self.foundation.requires_grad_(not self.config.freeze_foundation)
+        self.hidden = o3.Irreps(
+            [
+                (self.config.channels, (l, (-1) ** l))
+                for l in range(self.config.max_l + 1)
+            ]
+        )
+        self.env_embedding = torch.nn.Embedding(119, self.config.channels)
+        self.env_charge_embedding = torch.nn.Linear(1, self.config.channels, bias=False)
+        self.total_charge_embedding = torch.nn.ModuleList(
+            [
+                torch.nn.Linear(1, i.target_irreps[0].mul, bias=False)
+                for i in self.foundation.interactions
+            ]
+        )
+        self.env_layers = torch.nn.ModuleList(
+            [
+                EnvironmentInteraction(
+                    i.node_feats_irreps,
+                    i.target_irreps,
+                    self.hidden,
+                    float(self.r_max),
+                    self.config,
+                )
+                for i in self.foundation.interactions
+            ]
+        )
+        self.mixers = torch.nn.ModuleList(
+            [
+                o3.Linear(p.linear.irreps_out, self.hidden)
+                for p in self.foundation.products
+            ]
+        )
+        self.last_mixer = o3.Linear(
+            self.foundation.interactions[-1].target_irreps, self.hidden
+        )
+        self.global_encoder = GlobalEncoder(self.hidden, self.config)
+        # Scalar contractions of each angular block preserve parity and rotation.
+        nscalar = self.config.channels * (2 + 2 * (self.config.max_l + 1))
+        self.readout = torch.nn.Sequential(
+            torch.nn.Linear(nscalar, self.config.channels),
+            torch.nn.SiLU(),
+            torch.nn.Linear(self.config.channels, 1),
+        )
+        self.to(dtype=dtype, device=next(foundation.parameters()).device)
+        if self.config.cueq:
+            from ..backends import enable_cueq
+
+            enable_cueq(self)
+
+    @property
+    def r_max(self):
+        return self.foundation.r_max
+
+    @property
+    def atomic_numbers(self):
+        return self.foundation.atomic_numbers
+
+    @property
+    def heads(self):
+        return getattr(self.foundation, "heads", ["Default"])
+
+    def _invariants(self, h, f):
+        c = self.config.channels
+        result = [h[:, :c], f[:, :c]]
+        for (mul, ir), sl in zip(self.hidden, self.hidden.slices()):
+            a, b = h[:, sl].reshape(-1, mul, ir.dim), f[:, sl].reshape(-1, mul, ir.dim)
+            result.extend(((a * b).sum(-1), b.square().sum(-1)))
+        return torch.cat(result, -1)
 
     def forward(
         self,
         data,
         training=False,
         compute_force=True,
-        compute_polarizability=False,
-        compute_hessian=False,
-        **flags,
+        compute_response=False,
+        compute_charges=False,
     ):
-        allowed = {
-            "compute_virials",
-            "compute_stress",
-            "compute_displacement",
-            "compute_edge_forces",
-            "compute_atomic_stresses",
-            "lammps_mliap",
-        }
-        for name, value in flags.items():
-            if name not in allowed:
-                raise TypeError(f"Unknown forward argument: {name}")
-            if value:
-                raise NotImplementedError(f"EnvMACE does not support {name}")
-        if (
-            torch.compiler.is_compiling()
-            or torch.is_inference_mode_enabled()
-            or torch.jit.is_scripting()
-            or torch.jit.is_tracing()
-        ):
-            raise NotImplementedError(
-                "EnvMACE requires eager autograd, including at inference"
+        with torch.enable_grad():
+            data = dict(data)
+            if data.get("pbc") is not None and data["pbc"].any():
+                raise ValueError("EnvHead v2 requires nonperiodic data")
+            if data.get("total_spin") is not None and (data["total_spin"] != 1).any():
+                raise ValueError("EnvHead v2 currently supports singlet data")
+            data["positions"] = data["positions"].clone().requires_grad_(True)
+            data["mm_positions"] = data["mm_positions"].clone()
+            data["mm_charges"] = (
+                data["mm_charges"]
+                .clone()
+                .requires_grad_(compute_response or compute_charges)
             )
-        if self._envhead_active:
-            raise RuntimeError(
-                "Concurrent/reentrant EnvMACE calls require separate model instances"
-            )
-        self._envhead_active = True
-        try:
-            with torch.enable_grad():
-                return self._forward(
-                    data, training, compute_force, compute_polarizability, compute_hessian
+            if "mm_atomic_numbers" not in data:
+                if len(data["mm_positions"]):
+                    raise ValueError(
+                        "v2 requires mm_atomic_numbers for environment nodes"
+                    )
+                data["mm_atomic_numbers"] = torch.empty(
+                    0, dtype=torch.long, device=data["positions"].device
                 )
-        finally:
-            self._envhead_active = False
+            if len(data["mm_atomic_numbers"]) != len(data["mm_positions"]):
+                raise ValueError("Environment species and position counts differ")
+            graph = build_graph(data, float(self.r_max), self.config)
+            n = graph.qm_count
+            keep = (graph.edge_index < n).all(0)
+            native = {k: v for k, v in data.items() if not k.startswith("mm_")}
+            native["atomic_numbers"] = self.atomic_numbers[
+                data["node_attrs"].argmax(-1)
+            ]
+            native["edge_index"] = graph.edge_index[:, keep]
+            native["shifts"] = data["positions"].new_zeros(int(keep.sum()), 3)
+            native["unit_shifts"] = torch.zeros_like(native["shifts"])
+            ids = graph.env_indices
+            scalar = self.env_embedding(
+                data["mm_atomic_numbers"][ids]
+            ) + self.env_charge_embedding(data["mm_charges"][ids])
+            env = torch.cat(
+                (scalar, scalar.new_zeros(len(ids), self.hidden.dim - scalar.shape[1])),
+                -1,
+            )
+            products, last, handles = [], [], []
+            sizes = data["ptr"][1:] - data["ptr"][:-1]
+            local_q = (data["total_charge"].reshape(-1) / sizes)[data["batch"], None]
 
-    def _forward(self, data, training, compute_force, compute_polarizability, compute_hessian):
-        data = dict(data)
-        if data.get("pbc") is not None and data["pbc"].any():
-            raise NotImplementedError("Periodic embedding is unsupported")
-        positions = data["positions"]
-        if positions.dtype != next(self.parameters()).dtype:
-            raise ValueError("Input dtype must match the foundation and EnvHead")
-        mm = data["mm_positions"]
-        charges = data["mm_charges"]
-        counts = data["mm_count"].reshape(-1)
-        if mm.shape != (len(mm), 3) or charges.shape != (len(mm), 1):
-            raise ValueError("MM positions/charges must have shapes [M,3]/[M,1]")
-        if (
-            counts.dtype not in (torch.int32, torch.int64)
-            or (counts < 0).any()
-            or counts.sum() != len(mm)
-        ):
-            raise ValueError("Invalid mm_count")
-        if any(
-            x.dtype != positions.dtype or x.device != positions.device
-            for x in (mm, charges)
-        ):
-            raise ValueError("MM tensors must share QM dtype and device")
-        if not all(torch.isfinite(x).all() for x in (positions, mm, charges)):
-            raise ValueError("Nonfinite coordinates or source charges")
-        mm.requires_grad_(True)
-        ctx = prepare_graph(
-            data,
-            compute_virials=False,
-            compute_stress=False,
-            compute_displacement=False,
-            lammps_mliap=False,
-        )
-        ngraph = ctx.num_graphs
-        if len(counts) != ngraph:
-            raise ValueError("mm_count must contain one entry per graph")
-        # MM data belong exclusively to EnvHead. Native foundation sees QM only.
-        for key in ("external_field", "external_potential", "fermi_level"):
-            if data.get(key) is not None and data[key].any():
-                raise ValueError(
-                    "Supply environment through MM sources, not foundation external fields"
-                )
-        base_data = {k: v for k, v in data.items() if not k.startswith("mm_")}
-        base_data["atomic_numbers"] = self.atomic_numbers[data["node_attrs"].argmax(-1)]
-        foundation_result, tap = foundation_adapter(self).evaluate(self, base_data)
-        base = foundation_result["energy"]
-        edge_attrs = self.spherical_harmonics(ctx.vectors)
-        edge_feats, cutoff = self.radial_embedding(
-            ctx.lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
-        )
-        probe = (
-            positions.new_zeros(ngraph, 3, requires_grad=True)
-            if compute_polarizability
-            else None
-        )
-        shift = data.get("potential_shift", positions.new_zeros(ngraph)).reshape(-1)
-        origins = data.get("reference_origin", positions.new_zeros(ngraph, 3))
-        if shift.shape != (ngraph,) or origins.shape != (ngraph, 3):
-            raise ValueError("Invalid potential_shift/reference_origin shapes")
-        if any(
-            x.dtype != positions.dtype or x.device != positions.device
-            for x in (shift, origins)
-        ):
-            raise ValueError(
-                "Potential shift and reference origin must share coordinate dtype/device"
-            )
-        if not torch.isfinite(shift).all() or not torch.isfinite(origins).all():
-            raise ValueError("Nonfinite potential shift/reference origin")
-        if data.get("total_spin") is not None and (data["total_spin"] != 1).any():
-            raise NotImplementedError("Spin-dependent delta is not implemented")
-        # Explicit smooth cutoff for all new head paths, including edge MLPs
-        # whose bias could otherwise leave nonzero messages at the boundary.
-        cutoff = self.radial_embedding.cutoff_fn(ctx.lengths)
-        totals = data.get("total_charge", positions.new_zeros(ngraph)).reshape(-1)
-        if len(totals) != ngraph or not torch.isfinite(totals).all():
-            raise ValueError("total_charge must be finite, with one value per graph")
-        group_keys = ("charge_group", "charge_group_totals", "charge_group_count")
-        has_groups = [data.get(key) is not None for key in group_keys]
-        if any(has_groups) and not all(has_groups):
-            raise ValueError("All charge_group tensors must be supplied together")
-        group_counts = None
-        if all(has_groups):
-            group_counts = data["charge_group_count"].reshape(-1)
-            if (
-                group_counts.dtype not in (torch.int32, torch.int64)
-                or len(group_counts) != ngraph
-                or (group_counts < 1).any()
-                or group_counts.sum() != data["charge_group_totals"].numel()
-                or data["charge_group_totals"].ndim != 1
-                or data["charge_group"].shape != (len(positions),)
-            ):
-                raise ValueError("Invalid charge_group batch shapes or counts")
-        head_forward = self.env_head
-        if getattr(self, "_envhead_enable_cueq", False):
-            from functools import partial
-            from ..backends import call_cueq_head
+            def interaction_hook(index):
+                def hook(module, args, kwargs, output):
+                    nonlocal env
+                    incoming = kwargs["node_feats"]
+                    message, env = self.env_layers[index](
+                        incoming, env, graph, data["mm_charges"]
+                    )
+                    qmessage = self.total_charge_embedding[index](local_q)
+                    padding = torch.nn.functional.pad(
+                        qmessage[:, :, None], (0, output[0].shape[-1] - 1)
+                    )
+                    updated = output[0] + self.config.epsilon * message + padding
+                    last[:] = [flatten_message(updated, module.target_irreps)]
+                    return updated, output[1]
 
-            head_forward = partial(call_cueq_head, self)
-        out = head_forward(
-            tap,
-            positions,
-            mm,
-            charges,
-            totals,
-            data["node_attrs"],
-            data["edge_index"],
-            edge_attrs,
-            edge_feats,
-            cutoff,
-            data.get("charge_group"),
-            data.get("charge_group_totals"),
-            probe_field=probe,
-            potential_shift=shift,
-            reference_origin=origins,
-            graph_ptr=data["ptr"],
-            mm_counts=counts,
-            charge_group_counts=group_counts,
-            mm_cell=data.get("mm_cell"),
-            rf_cutoff=data.get("rf_cutoff"),
-            rf_dielectric=data.get("rf_dielectric", 78.4),
-            atomic_numbers=base_data["atomic_numbers"],
-        )
-        total = base + out["delta_energy"]
-        if not torch.isfinite(total).all():
-            raise FloatingPointError("Nonfinite total energy")
-        if compute_polarizability:
-            dipole = -torch.autograd.grad(
-                total.sum(), probe, create_graph=True, retain_graph=True
-            )[0]
-            alpha = torch.stack(
-                [
-                    torch.autograd.grad(
-                        dipole[:, j].sum(),
-                        probe,
-                        create_graph=training,
-                        retain_graph=True,
-                        allow_unused=True,
-                    )[0]
-                    for j in range(3)
-                ],
-                dim=1,
-            )
-            out.update(energy_dipole=dipole, polarizability=alpha)
-        forces, mm_forces = None, None
-        if compute_force or compute_hessian:
-            gradients = torch.autograd.grad(
-                total.sum(),
-                (positions, mm),
-                create_graph=training or compute_hessian,
-                retain_graph=training or compute_hessian,
-                allow_unused=True,
-            )
-            forces, mm_forces = tuple(
-                -grad if grad is not None else torch.zeros_like(pos)
-                for grad, pos in zip(gradients, (positions, mm))
-            )
-        if (compute_force or compute_hessian) and not all(
-            torch.isfinite(f).all() for f in (forces, mm_forces)
-        ):
-            raise FloatingPointError("Nonfinite coordinate forces")
-        hessian = None
-        if compute_hessian:
+                return hook
+
             try:
-                hessian = compute_hessians_vmap(forces, positions).detach()
-            except RuntimeError as error:
-                raise RuntimeError(
-                    "Analytic Hessian failed in the complete foundation/EnvHead "
-                    "autograd path; no numerical or backend fallback was applied"
-                ) from error
-            if not torch.isfinite(hessian).all():
-                raise FloatingPointError(
-                    "Nonfinite coordinate Hessian in the complete foundation/EnvHead "
-                    "energy. Check foundation second derivatives, including LES "
-                    "zero-distance self terms; no numerical fallback was applied"
+                for i, interaction in enumerate(self.foundation.interactions):
+                    handles.append(
+                        interaction.register_forward_hook(
+                            interaction_hook(i), with_kwargs=True
+                        )
+                    )
+                for product in self.foundation.products:
+                    handles.append(
+                        product.register_forward_hook(
+                            lambda module, args, output: products.append(output)
+                        )
+                    )
+                base = self.foundation(native, training=training, compute_force=False)
+            finally:
+                for handle in handles:
+                    handle.remove()
+            h = (
+                self.last_mixer(last[0])
+                if self.config.feature_source == "last_message"
+                else sum(m(x) for m, x in zip(self.mixers, products))
+            )
+            f = self.global_encoder(data)
+            # Conditional residual vanishes at zero global descriptor.
+            correction = (
+                self.readout(self._invariants(h, f))
+                - self.readout(self._invariants(h, torch.zeros_like(f)))
+            ).squeeze(-1)
+            energy = base["energy"] + sum_nodes(correction, data["batch"], len(sizes))
+            result = {"energy": energy}
+            if compute_force:
+                force = torch.autograd.grad(
+                    energy.sum(),
+                    data["positions"],
+                    create_graph=training,
+                    retain_graph=True,
+                    allow_unused=True,
+                )[0]
+                result["forces"] = (
+                    -force if force is not None else data["positions"] * 0
                 )
-        out.update(
-            energy=total,
-            base_energy=base,
-            forces=forces,
-            mm_forces=mm_forces,
-            node_energy=None,
-            stress=None,
-            virials=None,
-            hessian=hessian,
-            displacement=None,
-            node_feats=foundation_result.get("node_feats"),
-        )
-        if "les_energy" in foundation_result:
-            out["base_les_energy"] = foundation_result["les_energy"]
-        return out
+            if compute_response or compute_charges:
+                result.update(
+                    response_outputs(
+                        energy, data, self.config, training, compute_charges
+                    )
+                )
+            return result

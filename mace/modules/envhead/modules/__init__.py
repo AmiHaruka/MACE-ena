@@ -1,1 +1,1 @@
-"""Direct delta model, multipole kernels and fixed-depth electronic fusion."""
+"""Unified graph, environment operators, total energy and response diagnostics."""

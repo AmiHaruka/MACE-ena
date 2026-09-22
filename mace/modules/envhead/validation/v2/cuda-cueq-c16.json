@@ -1,0 +1,40 @@
+{
+  "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "dtype": "float32",
+  "qm": 31,
+  "mm": 747,
+  "env_selected": 617,
+  "edges": 18758,
+  "channels": 16,
+  "measurements": {
+    "e3nn": {
+      "ef": {
+        "ms": 319.6335223998176,
+        "peak_allocated_MiB": 1617.30029296875
+      },
+      "train": {
+        "ms": 568.3869036001852,
+        "peak_allocated_MiB": 1590.21337890625
+      }
+    },
+    "cueq": {
+      "ef": {
+        "ms": 54.87951319955755,
+        "peak_allocated_MiB": 1764.92041015625
+      },
+      "train": {
+        "ms": 141.53936599905137,
+        "peak_allocated_MiB": 1762.46923828125
+      }
+    }
+  },
+  "max_abs_difference": {
+    "energy": 0.0,
+    "forces": 1.0728836059570312e-06,
+    "response_potential": 1.9073486328125e-06
+  },
+  "speedup": {
+    "ef": 5.824277654168306,
+    "train": 4.015751374808296
+  }
+}

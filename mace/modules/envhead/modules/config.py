@@ -1,31 +1,69 @@
-"""Configuration for the direct-delta, fixed-depth multipole head."""
+"""Configuration for the unified-graph EnvHead v2 model."""
+
 from dataclasses import dataclass
-import math
 
 
 @dataclass
 class EnvHeadConfig:
-    fusion: str = "product"
-    charge_route: str = "fukui"
-    density_max_l: int = 2
-    mmc: bool = False
-    channels: int = 32
-    num_interactions: int = 2
+    channels: int = 16
+    max_l: int = 2
+    r_env: float = 5.0
+    backend: str = "ace"
+    triton: bool = False
+    cueq: bool = False
+    bidirectional: bool = True
+    feature_source: str = "mixed_products"
+    global_mode: str = "physical"
+    freeze_foundation: bool = False
+    epsilon: float = 1.0
+    radial: str = "polynomial"
+    radial_shape: float = 2.0
+    radial_baseline: float = 0.0
+    radial_amplitude: float = 1.0
+    radial_basis: int = 8
     correlation: int = 2
-    gaussian_width: float = 1.0
+    projection_width: float = 1.0
+    projection_hardness: float = 1.0
+    projection_regularization: float = 1e-4
+    projection_condition_limit: float = 1e8
     mm_chunk_size: int = 1024
 
     def __post_init__(self):
-        if self.fusion not in ("additive", "product", "message"):
-            raise ValueError("fusion must be additive, product or message")
-        if self.charge_route not in ("fukui", "eem", "sqe"):
-            raise ValueError("charge_route must be fukui, eem or sqe")
-        if self.density_max_l not in (1, 2):
-            raise ValueError("density_max_l must be 1 or 2")
-        if not isinstance(self.mmc, bool):
-            raise ValueError("mmc must be boolean")
-        for key in ("channels", "num_interactions", "correlation", "mm_chunk_size"):
-            if type(getattr(self, key)) is not int or getattr(self, key) < 1:
-                raise ValueError(f"{key} must be a positive integer")
-        if not math.isfinite(self.gaussian_width) or self.gaussian_width <= 0:
-            raise ValueError("gaussian_width must be finite and positive")
+        if self.backend not in ("ace", "painn", "e2former"):
+            raise ValueError("backend must be ace, painn or e2former")
+        if self.max_l < 1 or self.max_l > 2:
+            raise ValueError("v2 supports max_l=1 or 2")
+        if self.triton and self.backend != "e2former":
+            raise ValueError("Triton aggregation is an E2Former option")
+        if self.feature_source not in ("mixed_products", "last_message"):
+            raise ValueError("Unknown feature_source")
+        if self.global_mode not in ("physical", "learned"):
+            raise ValueError("Unknown global_mode")
+        if self.radial not in (
+            "constant",
+            "cosine",
+            "polynomial",
+            "mollifier",
+            "switch",
+            "bell",
+        ):
+            raise ValueError("Unknown radial modulation")
+        if (
+            min(self.channels, self.radial_basis, self.mm_chunk_size) < 1
+            or self.r_env < 0
+        ):
+            raise ValueError(
+                "Invalid channels, radial basis, chunk size or environment radius"
+            )
+        if (
+            min(
+                self.projection_width,
+                self.projection_hardness,
+                self.projection_regularization,
+                self.radial_shape,
+            )
+            <= 0
+        ):
+            raise ValueError(
+                "Widths, hardness, regularization and shape must be positive"
+            )

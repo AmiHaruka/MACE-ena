@@ -38,3 +38,16 @@ ORCA `CARTESIAN GRADIENT` 是梯度，力取负号并从 Hartree/Bohr 换算。
 
 当前已检查 Amino 的 26 份输出（13 类残基各 gas/pc），并完成小样本
 extxyz 回读、HDF5 写出及力符号/PC 匹配回归。未运行全量转换。
+
+## v2 additions
+
+ORCA conversion now extracts the final Mulliken table into `REF_charges` (native
+HDF5 property `charges`). Missing tables remain optional labels. It also writes
+`mm_atomic_numbers` when original trajectory `params.json` is available, checking
+PC order against `charge_used` and recovering elements from stored atomic masses.
+An explicit `frame.elements.json` array alongside `frame.pc` takes precedence.
+
+Unit/frame filenames produce `sample_id`, paired `pair_id`, and source `group_id`
+for grouped splitting. The model uses fixed `REF_charges`; no `charge_scheme`
+or configurable atomic-charge label key was added. v2 embedded training requires
+MM atomic numbers. Gas records contain empty environment element arrays.

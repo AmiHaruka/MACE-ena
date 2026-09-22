@@ -1,4 +1,4 @@
-"""Add environment tensors to existing MACE graphs; never add MM graph nodes."""
+"""Attach fixed-source arrays to native QM records; the model builds the union graph."""
 import torch
 
 

@@ -1,4 +1,5 @@
 """Group-aware train/validation indices, independent of file parsing."""
+
 import torch
 from torch.utils.data import Subset
 
@@ -15,10 +16,16 @@ def split_dataset(dataset, valid_fraction=0.1, seed=0):
         raise ValueError("valid_fraction must lie between zero and one")
     if not any(dataset.group_ids):
         if len(dataset) < 2:
-            raise ValueError("At least two samples required; supply an explicit validation file")
-        order = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed)).tolist()
+            raise ValueError(
+                "At least two samples required; supply an explicit validation file"
+            )
+        order = torch.randperm(
+            len(dataset), generator=torch.Generator().manual_seed(seed)
+        ).tolist()
         nvalid = max(1, min(len(dataset) - 1, round(len(dataset) * valid_fraction)))
-        return IndexedDataset(dataset, order[nvalid:]), IndexedDataset(dataset, order[:nvalid])
+        return IndexedDataset(dataset, order[nvalid:]), IndexedDataset(
+            dataset, order[:nvalid]
+        )
     if not all(dataset.group_ids):
         raise ValueError("Partial group_id labels: supply all groups or none")
     names = sorted(set(dataset.group_ids))

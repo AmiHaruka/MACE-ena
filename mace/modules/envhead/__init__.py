@@ -1,5 +1,5 @@
-"""Nonperiodic, fixed-source direct-delta environment extension for MACE."""
-__all__ = ["EnvHeadConfig", "EnvMACE", "NativeMACEAdapter", "register_adapter"]
+"""Unified-graph, fixed-source EnvHead v2 for MACE."""
+__all__ = ["EnvHeadConfig", "EnvMACE"]
 
 
 def __getattr__(name):
@@ -9,8 +9,6 @@ def __getattr__(name):
     modules = {
         "EnvHeadConfig": ".modules.config",
         "EnvMACE": ".modules.model",
-        "NativeMACEAdapter": ".adapters",
-        "register_adapter": ".adapters",
     }
     if name not in modules:
         raise AttributeError(name)

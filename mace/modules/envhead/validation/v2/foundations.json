@@ -1,0 +1,38 @@
+[
+  {
+    "foundation": "MACE-OFF23_small.model",
+    "dtype": "torch.float64",
+    "energy": [
+      -2081.1109574912857
+    ],
+    "force_norm": 0.41790438659923335,
+    "response": [
+      -0.02058229009095546,
+      -0.10823851432573697
+    ]
+  },
+  {
+    "foundation": "MACELES-OFF_small.model",
+    "dtype": "torch.float32",
+    "energy": [
+      -2081.013427734375
+    ],
+    "force_norm": 0.42413434386253357,
+    "response": [
+      0.2185393124818802,
+      0.4168950915336609
+    ]
+  },
+  {
+    "foundation": "DeepField_LR.model",
+    "dtype": "torch.float32",
+    "energy": [
+      -2075.568603515625
+    ],
+    "force_norm": 3.8948652744293213,
+    "response": [
+      17.150676727294922,
+      -5.384627819061279
+    ]
+  }
+]

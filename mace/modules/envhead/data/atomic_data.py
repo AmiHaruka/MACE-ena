@@ -1,4 +1,5 @@
 """One environment normalization point for native HDF5 and XYZ readers."""
+
 from dataclasses import replace
 
 import numpy as np
@@ -20,6 +21,7 @@ def key_specification(
     extra = (
         "mm_positions",
         "mm_charges",
+        "mm_atomic_numbers",
         "mm_count",
         "mm_forces",
         "mm_forces_weight",
@@ -45,6 +47,10 @@ class EnvAtomicData(AtomicData):
     @classmethod
     def from_config(cls, config, z_table, cutoff, **kwargs):
         props = config.properties
+        if props.get("charges") is None:
+            config = replace(
+                config, property_weights={**config.property_weights, "charges": 0.0}
+            )
         if config.pbc is not None and np.asarray(config.pbc).any():
             raise NotImplementedError("Periodic EnvHead training is unsupported")
         if props.get("multiplicity") is not None and int(props["multiplicity"]) != 1:
@@ -102,4 +108,10 @@ class EnvAtomicData(AtomicData):
         )
         for key in ("sample_id", "pair_id"):
             setattr(graph, key, str(props.get(key) or ""))
+        if props.get("mm_atomic_numbers") is not None:
+            graph.mm_atomic_numbers = torch.as_tensor(
+                props["mm_atomic_numbers"], dtype=torch.long
+            )
+        elif not len(pc_r):
+            graph.mm_atomic_numbers = torch.empty(0, dtype=torch.long)
         return graph
