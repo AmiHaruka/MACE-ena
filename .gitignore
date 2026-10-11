@@ -65,7 +65,13 @@ htmlcov/
 # local planning docs (not for the public repo)
 /doc
 
-# for mace-ena
+# EnvHead local configurations, documentation, tests and generated artifacts.
+/mace/modules/envhead/Foundation/
+/mace/modules/envhead/archive/
 /mace/modules/envhead/runs/
 /mace/modules/envhead/docs/
 /tests/extensions/envhead/
+/mace/modules/envhead/validation/
+/mace/modules/envhead/validation-*
+/mace/modules/envhead/ARCHITECTUREv*.md
+/mace/modules/envhead/IMPLEMENTATIONv*.md

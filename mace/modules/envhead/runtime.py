@@ -1,4 +1,4 @@
-"""Tensor inference for nonperiodic EnvHead v2 (eV, Angstrom, elementary charge)."""
+"""Tensor inference for nonperiodic EnvHead v3/v4 (eV, Angstrom, charge)."""
 
 import torch
 
@@ -19,6 +19,34 @@ class EnvRuntime:
         compute_force=True,
         compute_response=False,
         compute_charges=False,
+        compute_vacuum_charges=False,
+    ):
+        data = self._data(
+            atomic_numbers,
+            positions,
+            mm_positions,
+            mm_charges,
+            mm_atomic_numbers,
+            total_charge,
+            total_spin,
+        )
+        return self.model(
+            data,
+            compute_force=compute_force,
+            compute_response=compute_response,
+            compute_charges=compute_charges,
+            compute_vacuum_charges=compute_vacuum_charges,
+        )
+
+    def _data(
+        self,
+        atomic_numbers,
+        positions,
+        mm_positions=(),
+        mm_charges=(),
+        mm_atomic_numbers=(),
+        total_charge=0.0,
+        total_spin=1.0,
     ):
         p = next(self.model.parameters())
         r = torch.as_tensor(positions, dtype=p.dtype, device=p.device).reshape(-1, 3)
@@ -29,7 +57,7 @@ class EnvRuntime:
         mm = torch.as_tensor(mm_positions, dtype=p.dtype, device=p.device).reshape(
             -1, 3
         )
-        data = dict(
+        return dict(
             positions=r,
             node_attrs=attrs.to(p.dtype),
             batch=torch.zeros(len(r), dtype=torch.long, device=p.device),
@@ -48,9 +76,29 @@ class EnvRuntime:
             ),
             mm_count=torch.tensor([[len(mm)]], device=p.device),
         )
-        return self.model(
-            data,
-            compute_force=compute_force,
-            compute_response=compute_response,
-            compute_charges=compute_charges,
+
+    def compare_environment(
+        self,
+        atomic_numbers,
+        positions,
+        mm_positions=(),
+        mm_charges=(),
+        mm_atomic_numbers=(),
+        total_charge=0.0,
+        total_spin=1.0,
+        compute_charges=True,
+    ):
+        if getattr(self.model, "format_version", 3) != 4:
+            raise ValueError(
+                "compare_environment requires v4; use EnvHeadCalculator.compare_environment_charges for v3"
+            )
+        data = self._data(
+            atomic_numbers,
+            positions,
+            mm_positions,
+            mm_charges,
+            mm_atomic_numbers,
+            total_charge,
+            total_spin,
         )
+        return self.model.compare_environment(data, compute_charges=compute_charges)

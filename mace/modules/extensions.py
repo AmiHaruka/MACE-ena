@@ -649,6 +649,7 @@ class MACELES(ScaleShiftMACE):
             "hessian": hessian,
             "node_feats": node_feats_out,
             "les_energy": les_energy,
+            "interaction_energy": inter_e + les_energy,
             "latent_charges": les_result["latent_charges"],
             "latent_dipoles": les_result["latent_dipoles"],
             "latent_kappas": les_kappa,

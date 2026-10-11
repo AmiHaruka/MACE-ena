@@ -1,108 +1,62 @@
-# EnvHead v2
+# EnvHead v4
 
-Unified QM/environment messages condition native MACE energy readouts. Only QM
-nodes own energy; the target includes QM/background interaction, excludes MM
-self energy. Forces are derivatives of the complete predicted energy.
+近场 ENV 的元素、坐标、电荷和排列逐层参与 MACE QM 表示，远场电势/电场提供固定维度条件化。正常预测只执行一次主干和一次电荷头：
 
-## Data
+\[
+E=U_\theta(h^{cond})+E_{ele},\qquad E_{ele}=\sum_iq_i\phi_i^{all}.
+\]
 
-QM atoms use native MACE `REF_energy`, `REF_forces`, `total_charge` and optional
-`REF_charges`. `atoms.info` holds `mm_positions`, `mm_charges`,
-`mm_atomic_numbers`. Units are eV, Angstrom and elementary charge. Empty MM
-arrays represent gas configurations. Atomic-charge labels are never inputs.
+`energy` 为最终 QM 能量，`energy_ele` 为其中的显式交互。`compare_environment` 计算同参数无ENV的 `energy_vac`，返回完整变化 `energy_response=energy−energy_vac`。无ENV普通能量自然对应真空。ENV无参考能或自能，QM力从完整能量求导。
 
-```bash
-python mace/modules/envhead/script/orca.py /path/to/outputs \
-  --pc-dir /path/to/Traj2 --output /tmp/training.extxyz
-```
+细致方案见 [docs/README.md](docs/README.md)，另见 [架构图](docs/figures/architecture_v4.svg) 和 [验收报告](validation-v4.md)。
 
-The ORCA converter extracts Mulliken charges and reads environment elements from
-`frame.elements.json` alongside `frame.pc`, or the original `params.json`
-trajectory metadata. Explicit sidecars contain a JSON array of element symbols
-or atomic numbers in PC order. Missing metadata is not guessed from charges;
-v2 requires it for embedded inputs. ORCA labels retain their existing energy
-convention; `DoEQ` is rejected. `REF_charges` can later contain MBIS instead;
-prepare each dataset consistently without mixing charge definitions.
+## 训练
 
-## Training
-
-Example configuration (`config.json`):
-
-```json
-{"channels":16,"backend":"ace","r_env":5.0,"bidirectional":true,
- "feature_source":"mixed_products","global_mode":"physical",
- "freeze_foundation":false}
-```
+从 `mace/modules/envhead` 执行：
 
 ```bash
-python -m mace.modules.envhead.train --foundation /path/to/foundation.model \
-  --train-file /path/to/training.extxyz --head-config config.json \
-  --output-dir /tmp/envhead-run --device cuda --dtype float32 --enable-cueq --epochs 50
+conda activate deepfield
+bash runs/config/run_suite.sh --dry-run v4
+bash runs/config/run_suite.sh v4
 ```
 
-Use `--charges-weight 0.1` to enable optional charge supervision; default is zero.
-The converter writes source `group_id` for Unit/frame naming. Automatic splitting
-requires all group IDs; otherwise supply an explicitly separated `--valid-file`.
-Gas/PC pairs and the same trajectory must remain in the same split.
+只运行四套：Fukui/NQE E/F/q、Fukui/NQE E/F、projection E/F/q、projection E/F。默认 OFF23small、cuEq float32、λ5Å、C16、partial、多层读出；60epochs、batch900、OOM−30、Adam .01、Plateau .5/5；权重10/100/10或10/100/0。输出 `runs/amino_v4/`，保存 `best.pt`、`last.pt`。
 
-Resume with `--resume /tmp/envhead-run/last.pt`, retaining the training options.
-Checkpoints contain the full model, configuration, optimizer, scheduler and RNG
-state. Load only trusted model files. v1 head-only checkpoints are incompatible.
+服务器默认 `Foundation/MACE-OFF23_small.model` 和 `runs/config/amino_v2.extxyz`。可覆盖：
 
-Backends: `ace`, `painn`, `e2former`. The last is an O(3) first-order
-node-factorized adaptation of the E2Former identity, not the full UBio model or
-its Wigner/SO2 implementation. Optional `triton: true` uses vendored UBio sparse
-aggregation (CUDA float32 only); forward and second-backward parity passed on
-RTX 3060 with the deepfield environment outside the filesystem sandbox.
+```bash
+FOUNDATION=/path/to/MACE-OFF23_small.model TRAIN_FILE=/path/to/train.extxyz \
+VALID_FILE=/path/to/valid.extxyz bash runs/config/run_suite.sh v4
+RESUME=1 bash runs/config/run_suite.sh v4
+```
 
-## cuEq acceleration
+新CLI训练默认v4，恢复按checkpoint版本执行。旧v3 suite的 `all` 保持18套，旧脚本明确选择v3。新格式 `envhead-v4`，无权重转换。历史设计见 [v3说明](docs/README-v3.md)，配置见 [运行表](runs/config/README.md)。
 
-`--enable-cueq --device cuda --dtype float32` converts native and ENV ACE symmetric
-contractions, plus ENV ACE/E2 fully connected tensor products (`fused_tp`). These
-are live trainable modules, converted before optimizer creation. There is no
-frozen duplicate model/cache. Foundation convolutions, linears, PaiNN scalar/vector
-operations, graph construction and electrostatics retain their existing paths.
-
-Programmatic: `enable_cueq(model.cuda())` from `mace.modules.envhead.backends`, before
-creating an optimizer. ASE: `EnvHeadCalculator(model, device="cuda", enable_cueq=True)`.
-Converted full checkpoints are loaded on CUDA; do not switch backend mid-resume.
-A config with `cueq: true` requires constructing EnvMACE from a CUDA foundation.
-
-On one Amino I frame, float32/default 16 ENV channels/RTX 3060:
-E/F 319.6 -> 54.9 ms (**5.82x**), force-training forward/backward
-568.4 -> 141.5 ms (**4.02x**).
-This is a single-frame end-to-end benchmark, not a universal speed guarantee.
-Details and tolerances: [CUDA validation](validation-cuda.md).
-
-## Tensor and ASE inference
+## Tensor / ASE
 
 ```python
-from mace.modules.envhead.train.checkpoint import load_checkpoint
 from mace.modules.envhead.runtime import EnvRuntime
+from mace.modules.envhead.train.checkpoint import load_checkpoint
 from mace.modules.envhead.calculator import EnvHeadCalculator
 
-model = load_checkpoint('/tmp/envhead-run/last.pt')['model'].eval()
-result = EnvRuntime(model)(
-    atomic_numbers, positions, mm_positions, mm_charges, mm_atomic_numbers,
-    total_charge=0, compute_response=True, compute_charges=True,
-)
-atoms.calc = EnvHeadCalculator(model)
-energy, forces = atoms.get_potential_energy(), atoms.get_forces()
+model = load_checkpoint('/path/to/best.pt', device='cuda')['model']
+runtime = EnvRuntime(model)
+out = runtime(Z_Q, R_Q, R_ENV, b_ENV, Z_ENV, total_charge=Q)
+# energy, energy_ele, charges, forces
+comparison = runtime.compare_environment(Z_Q, R_Q, R_ENV, b_ENV, Z_ENV,
+                                         total_charge=Q)
+# 四个energy字段及 charges / charges_vacuum / delta_charges
+atoms.calc = EnvHeadCalculator(model, device='cuda')
+comparison = atoms.calc.compare_environment(atoms)  # 保留普通缓存
 ```
 
-Supply the environment arrays in `atoms.info` for ASE. Results optionally include
-`response_potential`, `interaction_energy`, `internal_energy`, `charges`,
-`charges_valid`, `charge_esp_rmse`, `charge_condition`. Gas or underdetermined
-charge reconstructions return invalid status and NaN charges; E/F remain valid.
-ASE `get_charges()` raises when reconstruction is invalid. Singlets and
-nonperiodic systems are supported. Current scoped forward hooks require a
-separate model instance for concurrent forwards.
+数据沿用extxyz/HDF5：`REF_energy`、`REF_forces`、`total_charge`、可选 `REF_charges`、`mm_positions`、`mm_charges`、`mm_atomic_numbers`。单位eV、Å、e；来源group_id划分，无gas/PC配对要求。当前非周期、单能量头、单重态。
 
-## Validation
+## 文件与 Git
 
-```bash
-python -m pytest tests/extensions/envhead/test_v2.py \
-  tests/extensions/envhead/test_orca_converter.py
-```
+模型源码纳入版本管理。`runs/`（包含 `runs/config/`）、`docs/`、EnvHead 测试目录、
+`Foundation/`、历史设计说明和验证产物均作为本地文件忽略；取消追踪不会删除本地文件。
 
-See [architecture](ARCHITECTUREv2.md) and [validation](validation-v2.md).
+2026-10-11 清理将旧 v1/v2 说明、配置和已失效的测试，以及退出调度的 ESP 配置，
+移入本地 `archive/2026-10-11-cleanup/`。该目录被忽略，`manifest.json` 记录原路径与文件哈希。
+当前设计入口为 `docs/README.md`；活动 v3/v4 运行配置和 checkpoint 加载逻辑保留。

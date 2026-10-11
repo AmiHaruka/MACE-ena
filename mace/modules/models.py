@@ -431,6 +431,7 @@ class MACE(torch.nn.Module):
             "energy": total_energy,
             "node_energy": node_energy,
             "contributions": contributions,
+            "interaction_energy": torch.sum(contributions[:, 1:], dim=-1),
             "forces": forces,
             "edge_forces": edge_forces,
             "virials": virials,

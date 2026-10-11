@@ -3,7 +3,8 @@
 Converted modules own the trainable parameters. No detached execution copies,
 parameter caches, or per-forward state-dict remapping are involved. The existing
 mul_ir message layout, foundation convolutions and e3nn linears remain unchanged.
-ENV ACE and E2 tensor products use the actual fused_tp CUDA kernel.
+ENV channelwise tensor products use uniform_1d CUDA kernels; the full-message
+comparison uses fused_tp. ACE contractions use cuEq symmetric products.
 """
 
 from copy import deepcopy
@@ -34,6 +35,31 @@ def _convert_fctp(source, device, dtype):
         with torch.no_grad():
             target.weight.copy_(source.weight.reshape_as(target.weight))
         target.weight.requires_grad_(source.weight.requires_grad)
+    return target
+
+
+def _convert_channelwise(source, device, dtype):
+    import cuequivariance as cue
+    import cuequivariance_torch as cuet
+    from mace.tools.cg import O3_e3nn
+
+    target = cuet.ChannelWiseTensorProduct(
+        cue.Irreps(O3_e3nn, str(source.irreps_in1)),
+        cue.Irreps(O3_e3nn, str(source.irreps_in2)),
+        cue.Irreps(O3_e3nn, str(source.irreps_out)),
+        layout=cue.mul_ir,
+        shared_weights=False,
+        internal_weights=False,
+        device=device,
+        dtype=dtype,
+        math_dtype=dtype,
+        method="uniform_1d",
+    )
+    if (
+        str(target.irreps_out) != str(source.irreps_out)
+        or target.weight_numel != source.weight_numel
+    ):
+        raise ValueError("cuEq channelwise paths differ from native MACE paths")
     return target
 
 
@@ -104,9 +130,12 @@ def enable_cueq(model):
             for layer in model.env_layers:
                 if hasattr(layer, "product"):
                     layer.product = _convert_product(layer.product, False)
-                    layer.tp = _convert_fctp(
-                        layer.tp, parameter.device, parameter.dtype
+                    convert = (
+                        _convert_channelwise
+                        if getattr(layer, "message_mode", "full") == "channelwise"
+                        else _convert_fctp
                     )
+                    layer.tp = convert(layer.tp, parameter.device, parameter.dtype)
                 elif layer.config.backend == "e2former":
                     layer.operator.tp = _convert_fctp(
                         layer.operator.tp, parameter.device, parameter.dtype
