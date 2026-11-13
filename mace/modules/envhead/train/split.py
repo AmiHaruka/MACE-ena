@@ -1,6 +1,9 @@
 """Group-aware train/validation indices, independent of file parsing."""
 
+from pathlib import Path
+
 import torch
+import numpy as np
 from torch.utils.data import Subset
 
 
@@ -19,12 +22,13 @@ def split_dataset(dataset, valid_fraction=0.1, seed=0):
             raise ValueError(
                 "At least two samples required; supply an explicit validation file"
             )
-        order = torch.randperm(
-            len(dataset), generator=torch.Generator().manual_seed(seed)
-        ).tolist()
-        nvalid = max(1, min(len(dataset) - 1, round(len(dataset) * valid_fraction)))
-        return IndexedDataset(dataset, order[nvalid:]), IndexedDataset(
-            dataset, order[:nvalid]
+        order = np.arange(len(dataset))
+        np.random.default_rng(seed).shuffle(order)
+        ntrain = min(
+            len(dataset) - int(len(dataset) * valid_fraction), len(dataset) - 1
+        )
+        return IndexedDataset(dataset, order[:ntrain].tolist()), IndexedDataset(
+            dataset, order[ntrain:].tolist()
         )
     if not all(dataset.group_ids):
         raise ValueError("Partial group_id labels: supply all groups or none")
@@ -46,6 +50,11 @@ def split_dataset(dataset, valid_fraction=0.1, seed=0):
             dataset, [i for i, g in enumerate(dataset.group_ids) if g in valid]
         ),
     )
+
+
+def save_validation_indices(dataset, path):
+    """Write original, zero-based frame indices even for a tiny validation set."""
+    Path(path).write_text("".join(f"{index}\n" for index in dataset.indices))
 
 
 def group_split(graphs, valid_fraction=0.1, seed=0):

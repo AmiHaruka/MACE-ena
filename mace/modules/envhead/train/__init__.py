@@ -1,4 +1,4 @@
-"""Training entry point; python -m mace.modules.envhead.train remains supported."""
+"""EnvHead training entry point."""
 
 
 def main():

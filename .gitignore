@@ -5,39 +5,46 @@ __pycache__/
 
 # Distribution / packaging
 build/
+dist/
+.eggs/
 *.egg-info/
+*.whl
 
 # virtual environments
 .venv/
 
-# pytest
+# Test, lint and type-checker caches
 .pytest_cache/
-
-# mypy
+.ruff_cache/
 .mypy_cache/
+.hypothesis/
+.cache/
 
 # IDE
 .idea/
 .vscode/
-*.txt
-!requirements/*.txt
-*.log
-
-# Distribution
-dist/
+*.swp
+*.swo
+*~
+*.tmp
 
 # Jupyter Notebook
-.ipynb_checkpoints
+.ipynb_checkpoints/
 
 # DS_Store
 .DS_Store
+
+# Local training data, model artifacts and run outputs
+*.log
 *.models
 *.pt
-/wandb
+/runs/
+/logs/
+/wandb/
 *.xyz
-/checkpoints
+/checkpoints/
 *.model
-/results
+/results/
 *.db
 
 # The golden references are committed on purpose: they are the numerical
@@ -46,14 +53,11 @@ dist/
 # (*.xyz, *.model, *.pt) would otherwise silently refuse them, and a golden
 # that is not in the clone is not a golden.
 !tests/golden/fixtures/*.xyz
+!tests/golden/datasets/*.xyz
 !tests/golden/models/*.model
 !tests/golden/models/*.pt
 
-.benchmarks
-*.png
-# Personal/scratch scripts stay untracked; the repo's own wrappers in
-# scripts/ remain tracked (gitignore does not affect already-tracked files).
-/scripts
+.benchmarks/
 *.cube
 
 # coverage artifacts
@@ -71,7 +75,11 @@ htmlcov/
 /mace/modules/envhead/runs/
 /mace/modules/envhead/docs/
 /tests/extensions/envhead/
+/tests/unit/test_envhead_*.py
 /mace/modules/envhead/validation/
 /mace/modules/envhead/validation-*
 /mace/modules/envhead/ARCHITECTUREv*.md
 /mace/modules/envhead/IMPLEMENTATIONv*.md
+
+# Local research tools and paper-specific experiments.
+/mace/modules/envhead/private/

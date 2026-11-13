@@ -1,5 +1,5 @@
-"""Fixed-source EnvHead: v4 single-pass models and preserved v3 models."""
-__all__ = ["EnvHeadConfig", "EnvMACE", "EnvHeadConfigV4", "EnvMACEV4"]
+"""Environment-aware MACE models."""
+__all__ = ["EnvHeadConfig", "EnvMACE"]
 
 
 def __getattr__(name):
@@ -9,8 +9,6 @@ def __getattr__(name):
     modules = {
         "EnvHeadConfig": ".modules.config",
         "EnvMACE": ".modules.model",
-        "EnvHeadConfigV4": ".modules.config_v4",
-        "EnvMACEV4": ".modules.model_v4",
     }
     if name not in modules:
         raise AttributeError(name)

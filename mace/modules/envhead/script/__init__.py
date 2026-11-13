@@ -1,1 +1,1 @@
-"""Standalone dataset extraction scripts, independent of EnvHead training."""
+"""Command-line entry points for model evaluation and OpenMM ML/MM."""

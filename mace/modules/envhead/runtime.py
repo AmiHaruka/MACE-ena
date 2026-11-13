@@ -1,11 +1,23 @@
-"""Tensor inference for nonperiodic EnvHead v3/v4 (eV, Angstrom, charge)."""
+"""Tensor inference for nonperiodic EnvHead models (eV, Angstrom, charge)."""
 
 import torch
 
 
 class EnvRuntime:
-    def __init__(self, model):
+    def __init__(self, model, neighbor_backend="reference", execution_mode=None):
         self.model = model
+        self.neighbor_backend = neighbor_backend
+        allowed = ("reference", "optimized")
+        if execution_mode is not None and execution_mode not in allowed:
+            raise ValueError(f"execution_mode must be one of {allowed}")
+        self.execution_mode = execution_mode or "optimized"
+        if getattr(model, "_cueq_enabled", False):
+            from .backends import enable_cueq, prepare_cueq_device
+
+            if next(model.parameters()).is_cuda:
+                enable_cueq(model)
+            else:
+                prepare_cueq_device(model)
 
     def __call__(
         self,
@@ -20,6 +32,8 @@ class EnvRuntime:
         compute_response=False,
         compute_charges=False,
         compute_vacuum_charges=False,
+        *,
+        compute_mm_force=False,
     ):
         data = self._data(
             atomic_numbers,
@@ -36,6 +50,9 @@ class EnvRuntime:
             compute_response=compute_response,
             compute_charges=compute_charges,
             compute_vacuum_charges=compute_vacuum_charges,
+            compute_mm_force=compute_mm_force,
+            neighbor_backend=self.neighbor_backend,
+            execution_mode=self.execution_mode,
         )
 
     def _data(
@@ -88,10 +105,6 @@ class EnvRuntime:
         total_spin=1.0,
         compute_charges=True,
     ):
-        if getattr(self.model, "format_version", 3) != 4:
-            raise ValueError(
-                "compare_environment requires v4; use EnvHeadCalculator.compare_environment_charges for v3"
-            )
         data = self._data(
             atomic_numbers,
             positions,
@@ -101,4 +114,8 @@ class EnvRuntime:
             total_charge,
             total_spin,
         )
-        return self.model.compare_environment(data, compute_charges=compute_charges)
+        return self.model.compare_environment(
+            data, compute_charges=compute_charges,
+            neighbor_backend=self.neighbor_backend,
+            execution_mode=self.execution_mode,
+        )

@@ -1,1 +1,1 @@
-"""Unified graph, environment operators, total energy and response diagnostics."""
+"""Environment encoding, charge reconstruction and molecular energy."""

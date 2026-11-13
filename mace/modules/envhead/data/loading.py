@@ -4,6 +4,7 @@ import logging
 from time import perf_counter
 
 import h5py
+from torch.utils.data import ConcatDataset
 
 from mace.data.hdf5_dataset import HDF5Dataset, unpack_value
 from mace.data.utils import config_from_atoms, load_from_xyz
@@ -52,6 +53,19 @@ def load_dataset(
     total_charge_key="total_charge",
     dipole_key="REF_dipole",
 ):
+    if isinstance(path, (list, tuple)):
+        if not path:
+            raise ValueError("Supply at least one dataset file")
+        datasets = [
+            load_dataset(
+                item, model, energy_key, forces_key, total_charge_key, dipole_key
+            )
+            for item in path
+        ]
+        combined = ConcatDataset(datasets)
+        combined.group_ids = [group for d in datasets for group in d.group_ids]
+        combined.sample_ids = [sample for d in datasets for sample in d.sample_ids]
+        return combined
     heads = getattr(model, "heads", ["Default"])
     if Path(path).suffix not in (".h5", ".hdf5"):
         started = perf_counter()
@@ -70,7 +84,7 @@ def load_dataset(
     with h5py.File(path, "r") as file:
         if "config_batch_0" not in file:
             raise ValueError(
-                "Expected native MACE HDF5 (config_batch_0); reconvert legacy EnvHead HDF5 from its logs"
+                "Expected native MACE HDF5 with config_batch_0"
             )
         size = len(file["config_batch_0"])
         if not size or set(file) != {f"config_batch_{i}" for i in range(len(file))}:

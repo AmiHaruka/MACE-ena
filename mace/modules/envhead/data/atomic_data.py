@@ -55,7 +55,7 @@ class EnvAtomicData(AtomicData):
             raise NotImplementedError("Periodic EnvHead training is unsupported")
         if props.get("multiplicity") is not None and int(props["multiplicity"]) != 1:
             raise NotImplementedError(
-                "Current EnvHead training supports singlet records only"
+                "EnvHead training supports singlet records only"
             )
         pc_r, pc_q = props.get("mm_positions"), props.get("mm_charges")
         if (pc_r is None) != (pc_q is None):
@@ -82,7 +82,7 @@ class EnvAtomicData(AtomicData):
             np.asarray(count).size != 1 or np.asarray(count).item() != len(pc_r)
         ):
             raise ValueError("mm_count does not match point sources")
-        # A single-head foundation owns the head label, including legacy HDF5.
+        # Use the foundation's head label for single-head inputs.
         heads = kwargs.get("heads", ["Default"])
         dtype = kwargs.pop("dtype", torch.get_default_dtype())
         previous = torch.get_default_dtype()

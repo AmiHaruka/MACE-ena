@@ -1,4 +1,4 @@
-"""Attach fixed-source arrays to native QM records; the model builds the union graph."""
+"""Attach MM environment arrays to native MACE configurations."""
 import torch
 
 

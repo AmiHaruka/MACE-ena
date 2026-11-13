@@ -1,4 +1,4 @@
-"""ACE environment messages in the selected near graph."""
+"""Once ENV densities and layerwise ACE messages in the selected near graph."""
 
 from dataclasses import dataclass
 
@@ -7,8 +7,8 @@ from e3nn import o3
 from mace.modules.blocks import EquivariantProductBasisBlock
 from mace.modules.irreps_tools import reshape_irreps, tp_out_irreps_with_instructions
 
-COULOMB = 14.3996454784255  # eV Angstrom / e^2
-
+from .electrostatics import COULOMB as COULOMB  # Existing validation-script import.
+from .graph import prepare_reference_edges
 
 def flatten_message(x, irreps):
     chunks, start = [], 0
@@ -33,10 +33,133 @@ class EnvironmentGeometry:
     spherical: torch.Tensor
 
 
+class OnceEnvironmentEncoder(torch.nn.Module):
+    """One scalar ENV context pass and one equivariant ENV-to-QM density."""
+
+    def __init__(self, hidden, cutoff, config):
+        super().__init__()
+        self.hidden, self.cutoff, self.config = hidden, cutoff, config
+        c = config.channels
+        self.register_buffer("centers", torch.linspace(0, 1, config.radial_basis))
+        self.context_source = torch.nn.Linear(c, c, bias=False)
+        self.context_radial = torch.nn.Sequential(
+            torch.nn.Linear(config.radial_basis, c),
+            torch.nn.SiLU(),
+            torch.nn.Linear(c, c),
+        )
+        self.context_update = torch.nn.Sequential(
+            torch.nn.Linear(2 * c, c), torch.nn.SiLU(), torch.nn.Linear(c, c)
+        )
+        self.source_radial = torch.nn.Sequential(
+            torch.nn.Linear(config.radial_basis, c),
+            torch.nn.SiLU(),
+            torch.nn.Linear(c, c * len(hidden)),
+        )
+        with torch.no_grad():
+            self.context_update[-1].weight.mul_(0.01)
+            self.context_update[-1].bias.zero_()
+
+    def radial_basis(self, distance):
+        return torch.exp(
+            -(
+                (
+                    (distance[:, None] / self.cutoff - self.centers)
+                    * self.config.radial_basis
+                )
+                ** 2
+            )
+        )
+
+    def forward(self, graph, scalar, charges, *, edge_geometry=None):
+        n, c = graph.qm_count, self.config.channels
+        ee, eq = (
+            edge_geometry
+            if edge_geometry is not None
+            else prepare_reference_edges(graph)
+        )
+        messages = (
+            self.context_source(scalar)[ee.src]
+            * self.context_radial(self.radial_basis(ee.lengths))
+            * ee.weight[:, None]
+        )
+        context = sum_nodes(messages, ee.dst, len(scalar)) / 4
+        chemical = scalar + self.context_update(torch.cat((scalar, context), -1))
+
+        radial = self.source_radial(self.radial_basis(eq.lengths))
+        radial = radial.reshape(len(eq.src), len(self.hidden), c)
+        spherical = o3.spherical_harmonics(
+            o3.Irreps.spherical_harmonics(self.config.max_l),
+            eq.vectors,
+            normalize=True,
+            normalization="component",
+        )
+        # Zero-charge sites retain chemical context through EE; direct transfer
+        # is charge-gated so an all-zero background recovers the vacuum model.
+        source = chemical[eq.src] * (eq.weight * charges[eq.src])[:, None]
+        aggregate = (
+            self._aggregate if edge_geometry is not None else self._aggregate_reference
+        )
+        return aggregate(source, radial, spherical, eq.dst, n)
+
+    def _aggregate(self, source, radial, spherical, dst, n):
+        # Expand views per angular block, then reduce all lm components once.
+        # flatten_message restores the existing l, channel, m irreps layout.
+        weighted = source[:, None, :] * radial
+        angular_radial = torch.cat(
+            [
+                block[..., None].expand(-1, -1, ir.dim)
+                for block, (_, ir) in zip(weighted.unbind(1), self.hidden)
+            ],
+            -1,
+        )
+        messages = angular_radial * spherical[:, None, :]
+        return flatten_message(sum_nodes(messages, dst, n) / 4, self.hidden)
+
+    def _aggregate_reference(self, source, radial, spherical, dst, n):
+        blocks, start = [], 0
+        for k, (_, ir) in enumerate(self.hidden):
+            message = (source * radial[:, k])[:, :, None] * spherical[
+                :, None, start : start + ir.dim
+            ]
+            blocks.append((sum_nodes(message, dst, n) / 4).flatten(1))
+            start += ir.dim
+        return torch.cat(blocks, -1)
+
+
+class EnvironmentGate(torch.nn.Module):
+    """Condition a shared ENV density on the current QM layer's even scalars."""
+
+    def __init__(self, qm_irreps, out_irreps, hidden, cutoff, config):
+        super().__init__()
+        self.hidden = hidden
+        self.scalar_slices = tuple(
+            sl
+            for (_, ir), sl in zip(qm_irreps, qm_irreps.slices())
+            if ir == o3.Irrep("0e")
+        )
+        width = sum(sl.stop - sl.start for sl in self.scalar_slices)
+        self.gate = torch.nn.Linear(width, config.channels)
+        self.output = o3.Linear(hidden, out_irreps)
+        self.output_layout = reshape_irreps(out_irreps)
+        torch.nn.init.zeros_(self.gate.weight)
+        torch.nn.init.zeros_(self.gate.bias)
+
+    def forward(
+        self, qm_features, env_features, graph, charges, update_env=True, geometry=None
+    ):
+        scalar = torch.cat([qm_features[:, sl] for sl in self.scalar_slices], -1)
+        gate = 2 * torch.sigmoid(self.gate(scalar))
+        blocks = []
+        for (mul, ir), sl in zip(self.hidden, self.hidden.slices()):
+            block = geometry[:, sl].reshape(len(gate), mul, ir.dim)
+            blocks.append((block * gate[:, :, None]).flatten(1))
+        return self.output_layout(self.output(torch.cat(blocks, -1))), None
+
+
 class EnvironmentInteraction(torch.nn.Module):
     def __init__(self, qm_irreps, out_irreps, hidden, cutoff, config):
         super().__init__()
-        self.hidden, self.config, self.cutoff = hidden, config, cutoff
+        self.config, self.cutoff = config, cutoff
         self.qm_map = o3.Linear(qm_irreps, hidden)
         self.output = o3.Linear(hidden, out_irreps)
         self.output_layout = reshape_irreps(out_irreps)

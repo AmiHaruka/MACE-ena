@@ -23,50 +23,102 @@ def parameter_group(name):
         return "foundation_interactions_products"
     if name.startswith("charge_reconstruction"):
         return "charge_head"
-    if name.startswith("response_readout"):
-        return "residual_head"
     return "environment_and_mixers"
 
 
-def adam_update(parameters, gradient, used, state_dict, scale=1.0, fresh=False):
+def adam_update(
+    parameters,
+    gradient,
+    used,
+    state_dict,
+    scale=1.0,
+    fresh=False,
+    *,
+    parameter_names=None,
+):
     """Compute, without applying, an Adam step. Saved moments stay unchanged."""
-    result = []
+    parameters = list(parameters)
+    sizes = [parameter.numel() for parameter in parameters]
+    if len(used) != len(parameters) or gradient.numel() != sum(sizes):
+        raise ValueError("Gradient and usage mask must match the model parameters")
+    slices = []
     offset = 0
-    index = 0
-    for group in state_dict["param_groups"]:
-        b1, b2 = group["betas"]
-        for ident in group["params"]:
-            p = parameters[index]
-            size = p.numel()
-            g = gradient[offset : offset + size] * scale
-            if not used[index]:
-                result.append(torch.zeros_like(g))
-            else:
-                if group.get("maximize", False):
-                    g = -g
-                if group.get("weight_decay", 0):
-                    g = g + group["weight_decay"] * p.detach().cpu().double().flatten()
-                state = {} if fresh else state_dict["state"].get(ident, {})
-
-                def moment(key):
-                    return (
-                        state[key].detach().cpu().double().flatten()
-                        if key in state
-                        else torch.zeros_like(g)
+    for size in sizes:
+        slices.append(slice(offset, offset + size))
+        offset += size
+    groups = state_dict["param_groups"]
+    named = ["param_names" in group for group in groups]
+    if any(named):
+        if not all(named) or parameter_names is None:
+            raise ValueError(
+                "Named optimizer groups require matching model parameter_names"
+            )
+        if len(parameter_names) != len(parameters) or len(set(parameter_names)) != len(
+            parameters
+        ):
+            raise ValueError("Model parameter_names must identify each parameter once")
+        indices = {name: index for index, name in enumerate(parameter_names)}
+        ordered = []
+        for group in groups:
+            if len(group["param_names"]) != len(group["params"]):
+                raise ValueError("Optimizer param_names must match each group's params")
+            for ident, name in zip(group["params"], group["param_names"]):
+                if name not in indices:
+                    raise ValueError(
+                        f"Optimizer parameter is absent from model: {name}"
                     )
+                ordered.append((group, ident, indices[name]))
+    else:
+        if len(groups) != 1 or len(groups[0]["params"]) != len(parameters):
+            raise ValueError(
+                "Cannot map unnamed optimizer groups; saved param_names are required"
+            )
+        ordered = [
+            (groups[0], ident, index) for index, ident in enumerate(groups[0]["params"])
+        ]
+    if len(ordered) != len(parameters) or len(
+        {index for _, _, index in ordered}
+    ) != len(parameters):
+        raise ValueError(
+            "Optimizer groups must cover each model parameter exactly once"
+        )
+    if len({ident for _, ident, _ in ordered}) != len(ordered):
+        raise ValueError("Optimizer parameter identifiers must be unique")
 
-                step = float(state.get("step", 0)) + 1
-                m = b1 * moment("exp_avg") + (1 - b1) * g
-                v = b2 * moment("exp_avg_sq") + (1 - b2) * g.square()
-                if group.get("amsgrad", False):
-                    v = torch.maximum(v, moment("max_exp_avg_sq"))
-                result.append(
-                    -group["lr"]
-                    * (m / (1 - b1**step))
-                    / ((v / (1 - b2**step)).sqrt() + group["eps"])
+    gradient = gradient.detach().cpu().double().flatten()
+    result = [None] * len(parameters)
+    for group, ident, index in ordered:
+        b1, b2 = group["betas"]
+        p = parameters[index]
+        g = gradient[slices[index]] * scale
+        if not used[index]:
+            result[index] = torch.zeros_like(g)
+            continue
+        if group.get("maximize", False):
+            g = -g
+        if group.get("weight_decay", 0):
+            g = g + group["weight_decay"] * p.detach().cpu().double().flatten()
+        state = {} if fresh else state_dict["state"].get(ident, {})
+
+        def moment(key):
+            if key not in state:
+                return torch.zeros_like(g)
+            if state[key].shape != p.shape:
+                raise ValueError(
+                    f"Optimizer moment {key} shape does not match its model parameter"
                 )
-            offset += size
-            index += 1
+            return state[key].detach().cpu().double().flatten()
+
+        step = float(state.get("step", 0)) + 1
+        m = b1 * moment("exp_avg") + (1 - b1) * g
+        v = b2 * moment("exp_avg_sq") + (1 - b2) * g.square()
+        if group.get("amsgrad", False):
+            v = torch.maximum(v, moment("max_exp_avg_sq"))
+        result[index] = (
+            -group["lr"]
+            * (m / (1 - b1**step))
+            / ((v / (1 - b2**step)).sqrt() + group["eps"])
+        )
     return torch.cat(result)
 
 
@@ -156,7 +208,15 @@ def diagnose(model, batches, criterion, optimizer_state):
     updates = {}
     for fresh in (False, True):
         for scale in (1.0, 10.0):
-            delta = adam_update(params, total, used, optimizer_state, scale, fresh)
+            delta = adam_update(
+                params,
+                total,
+                used,
+                optimizer_state,
+                scale,
+                fresh,
+                parameter_names=[name for name, _ in named],
+            )
             updates[f"{'fresh' if fresh else 'saved'}_scale_{int(scale)}"] = {
                 "gradient_norm": float((total * scale).norm()),
                 "update_norm": float(delta.norm()),
@@ -165,9 +225,9 @@ def diagnose(model, batches, criterion, optimizer_state):
                 },
             }
     result["hypothetical_updates"] = updates
-    result["note"] = (
-        "No parameters or optimizer state updated. Saved-scale comparisons keep original moments; fresh comparisons use zero moments."
-    )
+    result[
+        "note"
+    ] = "No parameters or optimizer state updated. Saved-scale comparisons keep original moments; fresh comparisons use zero moments."
     return result
 
 
@@ -193,19 +253,30 @@ def main():
         for i in range(0, len(indices), args.batch_size)
     ]
     cfg = saved.get("training_args", {})
+    stage = saved.get("stage", 1)
+    prefix = "stage_two_" if stage == 2 else ""
+    defaults = (
+        (100.0, 10.0, cfg.get("charges_weight", 10.0))
+        if stage == 2
+        else (10.0, 100.0, 10.0)
+    )
     criterion = EnvHeadLoss(
         *(
-            cfg.get(k, d)
-            for k, d in [
-                ("energy_weight", 10.0),
-                ("forces_weight", 100.0),
-                ("charges_weight", 10.0),
-            ]
+            cfg.get(prefix + key, default)
+            for key, default in zip(
+                ("energy_weight", "forces_weight", "charges_weight"), defaults
+            )
         )
     )
     report = diagnose(model, batches, criterion, saved["optimizer"])
     report["sample_indices"] = indices
     report["checkpoint_epoch"] = saved["epoch"]
+    report["checkpoint_stage"] = stage
+    report["loss_weights"] = dict(
+        energy=criterion.energy_weight,
+        forces=criterion.forces_weight,
+        charges=criterion.charges_weight,
+    )
     text = json.dumps(report, indent=2)
     print(text)
     if args.output:

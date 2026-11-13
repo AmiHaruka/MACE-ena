@@ -1,0 +1,6 @@
+{
+  "environment_mode": "once",
+  "field_source": "all",
+  "near_radius": 5.0,
+  "charge_mode": "fukui_projection"
+}

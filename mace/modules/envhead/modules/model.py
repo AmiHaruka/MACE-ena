@@ -1,34 +1,28 @@
-"""v3: shared vacuum/embedded features, reconstructed QM charges, explicit qV."""
+"""One conditioned foundation pass plus full-source QM--ENV monopole energy."""
 
 from copy import deepcopy
 import torch
 from e3nn import o3
 from mace.modules.models import MACE, ScaleShiftMACE
 from mace.modules.extensions import MACELES
+
 from .config import EnvHeadConfig
-from .graph import build_graph, qm_edges
-from .encoders import EnvironmentInteraction, flatten_message, sum_nodes
-from .electrostatics import potentials
 from .charges import ChargeReconstruction
-from .readout import ResponseReadout
-from .execution import VacuumTrace, run_shared_passes
-
-
-class _FeaturesReady(Exception):
-    """End a native feature-only pass before final readouts/LES electrostatics."""
+from .encoders import (
+    EnvironmentGate,
+    EnvironmentInteraction,
+    OnceEnvironmentEncoder,
+    sum_nodes,
+    flatten_message,
+)
+from .electrostatics import grouped_potentials, potentials
+from .graph import build_graph, prepare_once_edges, qm_edges
 
 
 class EnvMACE(torch.nn.Module):
-    format_version = 3
+    format_version = 4
 
-    def __init__(
-        self,
-        foundation,
-        config=None,
-        dtype=None,
-        _build_response_head=True,
-        _charge_class=ChargeReconstruction,
-    ):
+    def __init__(self, foundation, config=None, dtype=None):
         super().__init__()
         self.config = config or EnvHeadConfig()
         if type(foundation) not in (MACE, ScaleShiftMACE, MACELES):
@@ -38,12 +32,6 @@ class EnvMACE(torch.nn.Module):
         self.foundation = deepcopy(foundation)
         dtype = dtype or next(foundation.parameters()).dtype
         self.foundation.to(dtype=dtype)
-        self.foundation.requires_grad_(self.config.finetune == "full")
-        if self.config.finetune == "partial":
-            self.foundation.interactions[-1].requires_grad_(True)
-            self.foundation.products[-1].requires_grad_(True)
-            self.foundation.readouts.requires_grad_(True)
-        self.foundation.atomic_energies_fn.requires_grad_(False)
         self.hidden = o3.Irreps(
             [
                 (self.config.channels, (l, (-1) ** l))
@@ -58,9 +46,14 @@ class EnvMACE(torch.nn.Module):
                 for i in self.foundation.interactions
             ]
         )
+        environment_class = (
+            EnvironmentGate
+            if self.config.environment_mode == "once"
+            else EnvironmentInteraction
+        )
         self.env_layers = torch.nn.ModuleList(
             [
-                EnvironmentInteraction(
+                environment_class(
                     i.node_feats_irreps,
                     i.target_irreps,
                     self.hidden,
@@ -73,8 +66,7 @@ class EnvMACE(torch.nn.Module):
         self.far_layers = torch.nn.ModuleList(
             [o3.Linear("0e+1o", i.target_irreps) for i in self.foundation.interactions]
         )
-        # New adapters should perturb, rather than overwhelm, pretrained ACE
-        # messages. Nonzero small initialization preserves first-step gradients.
+        # Small nonzero adapter messages preserve first-step gradients.
         with torch.no_grad():
             for layer in self.env_layers:
                 layer.output.weight.mul_(0.01)
@@ -98,14 +90,39 @@ class EnvMACE(torch.nn.Module):
         self.last_mixer = o3.Linear(
             self.foundation.interactions[-1].target_irreps, self.hidden
         )
-        self.charge_reconstruction = _charge_class(self.hidden, self.config)
-        if _build_response_head:
-            self.response_readout = ResponseReadout(self.hidden, self.config)
+        self.charge_reconstruction = ChargeReconstruction(self.config)
         self.to(dtype=dtype, device=next(foundation.parameters()).device)
         if self.config.cueq:
             from ..backends import enable_cueq
 
             enable_cueq(self)
+        config = self.config
+        if config.environment_mode == "once":
+            self.env_encoder = OnceEnvironmentEncoder(
+                self.hidden, float(self.r_max), config
+            ).to(next(self.parameters()))
+            # Initialize known ENV elements from the foundation's chemical
+            # embedding; independent rows can then adapt to MM environments.
+            with torch.no_grad():
+                features = self.foundation.node_embedding(
+                    torch.eye(
+                        len(self.atomic_numbers),
+                        device=self.atomic_numbers.device,
+                        dtype=next(self.parameters()).dtype,
+                    )
+                )
+                projection = torch.nn.Linear(
+                    features.shape[1], config.channels, bias=False
+                ).to(features)
+                self.env_embedding.weight[self.atomic_numbers] = projection(features)
+        # Conversion creates new contraction parameters. Select trainability
+        # after conversion, before the training entry point creates Adam.
+        self.foundation.requires_grad_(self.config.finetune == "full")
+        if self.config.finetune == "partial":
+            self.foundation.interactions[-1].requires_grad_(True)
+            self.foundation.products[-1].requires_grad_(True)
+            self.foundation.readouts.requires_grad_(True)
+        self.foundation.atomic_energies_fn.requires_grad_(False)
 
     @property
     def r_max(self):
@@ -120,29 +137,20 @@ class EnvMACE(torch.nn.Module):
         return getattr(self.foundation, "heads", ["Default"])
 
     def _pass(
-        self,
-        native,
-        data,
-        graph,
-        far,
-        embedded,
-        training,
-        capture_common=False,
-        complete_embedded_energy=False,
-        environment_geometry=None,
+        self, native, data, graph, far, embedded, training, environment_geometry=None,
+        *, read_features=True,
     ):
-        """Scoped native hooks preserve each supported foundation's preprocessing.
+        """Condition each native interaction, then retain native energy assembly.
 
-        The v3 feature-only pass stops at the final product. V4 explicitly
-        continues to the native energy assembly. Hook handles are removed on
-        both success and exceptions.
-        Concurrent forwards require separate model instances.
+        Hooks are scoped to this call, including exceptional exits. Concurrent
+        forwards require separate model instances.
         """
-        if embedded:
+        if embedded and not hasattr(self, "env_encoder"):
             ids = graph.env_indices
-            scalar = self.env_embedding(
-                data["mm_atomic_numbers"][ids]
-            ) + self.env_charge_embedding(data["mm_charges"][ids].reshape(-1, 1))
+            scalar = self.env_embedding(data["mm_atomic_numbers"][ids])
+            scalar = scalar + self.env_charge_embedding(
+                data["mm_charges"][ids].reshape(-1, 1)
+            )
             env = torch.nn.functional.pad(
                 scalar, (0, self.hidden.dim - scalar.shape[1])
             )
@@ -150,57 +158,40 @@ class EnvMACE(torch.nn.Module):
             env = None
         sizes = data["ptr"][1:] - data["ptr"][:-1]
         local_q = (data["total_charge"].reshape(-1) / sizes)[data["batch"], None]
-        products, last, handles = [], [], []
-        trace = VacuumTrace() if capture_common else None
+        products, handles = [], []
+        last = None
 
         def interaction_hook(index):
             def hook(module, args, kwargs, output):
-                nonlocal env
+                nonlocal env, last
                 padding = torch.nn.functional.pad(
                     self.total_charge_embedding[index](local_q)[:, :, None],
                     (0, output[0].shape[-1] - 1),
                 )
                 updated = output[0] + padding
-                if trace is not None:
-                    trace.charge_terms.append(padding)
-                    if index == 0:
-                        trace.interaction_kwargs = dict(kwargs)
-                        trace.first_message, trace.first_sc = output
-                        trace.first_conditioned_message = updated
                 if embedded:
-                    environment_kwargs = {}
-                    if environment_geometry is not None:
-                        environment_kwargs["geometry"] = environment_geometry
                     message, env = self.env_layers[index](
                         kwargs["node_feats"],
                         env,
                         graph,
                         data["mm_charges"],
                         update_env=index < len(self.env_layers) - 1,
-                        **environment_kwargs,
+                        geometry=environment_geometry,
                     )
                     field = self.env_layers[index].output_layout(
                         self.far_layers[index](far)
                     )
                     updated = updated + self.config.epsilon * message + field
-                last[:] = [flatten_message(updated, module.target_irreps)]
+                if (
+                    read_features
+                    and self.config.feature_source == "last_message"
+                    and index == len(self.env_layers) - 1
+                ):
+                    last = flatten_message(updated, module.target_irreps)
                 return updated, output[1]
 
             return hook
 
-        def product_hook(index):
-            def hook(module, args, output):
-                products.append(output)
-                if (
-                    embedded
-                    and not complete_embedded_energy
-                    and index == len(self.foundation.products) - 1
-                ):
-                    raise _FeaturesReady()
-
-            return hook
-
-        base = None
         try:
             for i, interaction in enumerate(self.foundation.interactions):
                 handles.append(
@@ -208,45 +199,113 @@ class EnvMACE(torch.nn.Module):
                         interaction_hook(i), with_kwargs=True
                     )
                 )
-            for i, product in enumerate(self.foundation.products):
-                handles.append(product.register_forward_hook(product_hook(i)))
-            try:
-                base = self.foundation(
-                    dict(native), training=training, compute_force=False
-                )
-            except _FeaturesReady:
-                if not embedded:
-                    raise
+            if read_features and self.config.feature_source == "mixed_products":
+                for product in self.foundation.products:
+                    handles.append(
+                        product.register_forward_hook(
+                            lambda module, args, output: products.append(output)
+                        )
+                    )
+            base = self.foundation(dict(native), training=training, compute_force=False)
         finally:
             for handle in handles:
                 handle.remove()
-        h = (
-            self.last_mixer(last[0])
+        if not read_features:
+            return base, None
+        features = (
+            self.last_mixer(last)
             if self.config.feature_source == "last_message"
             else sum(m(x) for m, x in zip(self.mixers, products))
         )
-        return (base, h, trace) if capture_common else (base, h)
+        return base, features
 
-    def forward(
+    def _energy_forward(
+        self, data, training=False, compute_charges=False,
+        execution_mode="optimized", neighbor_backend="reference",
+        *, prepared_environment=None,
+    ):
+        """One energy graph, without cloning coordinates or taking derivatives.
+
+        A prepared environment is (graph, potential, [potential, Ex, Ey, Ez]),
+        with potential in eV/e and field in eV/(e Angstrom).
+        Its geometry and fields must share the caller's
+        coordinate graph. Periodic engine adapters differentiate the returned
+        scalar, including their corrections, outside this method.
+        """
+        data = dict(data)
+        data["atomic_numbers"] = self.atomic_numbers[data["node_attrs"].argmax(-1)]
+        native = {key: value for key, value in data.items()
+                  if not key.startswith("mm_")}
+        embedded = len(data["mm_positions"]) > 0
+        if prepared_environment is not None and not embedded:
+            raise ValueError("A prepared environment requires background sites")
+        if embedded:
+            if prepared_environment is None:
+                graph = build_graph(
+                    data, float(self.r_max), self.config,
+                    neighbor_backend=neighbor_backend, owner=self,
+                    role_geometry=(execution_mode == "optimized"
+                                   and hasattr(self, "env_encoder")),
+                    unchunked=execution_mode == "optimized",
+                )
+                operation = grouped_potentials if execution_mode == "optimized" else potentials
+                phi, far = operation(data, self.config)
+            else:
+                graph, phi, far = prepared_environment
+            native["edge_index"] = graph.edge_index[
+                :, (graph.edge_index < graph.qm_count).all(0)
+            ]
+            far = far / self.field_units
+            if hasattr(self, "env_encoder"):
+                ids = graph.env_indices
+                scalar = self.env_embedding(data["mm_atomic_numbers"][ids])
+                scalar = scalar + self.env_charge_embedding(data["mm_charges"][ids])
+                geometry = self.env_encoder(
+                    graph, scalar, data["mm_charges"][ids].flatten(),
+                    edge_geometry=(prepare_once_edges(graph, data["mm_positions"])
+                                   if execution_mode == "optimized" else None),
+                )
+            else:
+                geometry = self.env_layers[0].prepare_geometry(graph)
+        else:
+            graph, phi, far, geometry = None, None, None, None
+            native["edge_index"] = qm_edges(
+                data, float(self.r_max), self.config.near_radius,
+                neighbor_backend=neighbor_backend, owner=self,
+            )
+        native["shifts"] = data["positions"].new_zeros(native["edge_index"].shape[1], 3)
+        native["unit_shifts"] = torch.zeros_like(native["shifts"])
+        base, features = self._pass(
+            native, data, graph, far, embedded, training,
+            environment_geometry=geometry,
+        )
+        reconstructed = self.charge_reconstruction(features, data, diagnostics=compute_charges)
+        ele = (sum_nodes(reconstructed["charges"] * phi, data["batch"], len(data["ptr"])-1)
+               if embedded else torch.zeros_like(base["energy"]))
+        return dict(energy=base["energy"] + ele, energy_ele=ele, **reconstructed), base
+
+    def _forward_once(
         self,
         data,
         training=False,
         compute_force=True,
         compute_response=False,
         compute_charges=False,
-        compute_vacuum_charges=False,
-        execution_mode="shared",
+        execution_mode="optimized",
+        neighbor_backend="reference",
+        *,
+        compute_mm_force=False,
     ):
-        if execution_mode not in ("legacy", "shared"):
-            raise ValueError("execution_mode must be legacy or shared")
         with torch.enable_grad():
             data = dict(data)
             if data.get("pbc") is not None and data["pbc"].any():
-                raise ValueError("EnvHead v3 requires nonperiodic data")
+                raise ValueError("EnvHead requires nonperiodic data")
             if data.get("total_spin") is not None and (data["total_spin"] != 1).any():
-                raise ValueError("EnvHead v3 currently supports singlet data")
+                raise ValueError("EnvHead supports singlet data")
             data["positions"] = data["positions"].clone().requires_grad_(True)
             data["mm_positions"] = data["mm_positions"].clone()
+            if compute_mm_force:
+                data["mm_positions"].requires_grad_(True)
             data["mm_charges"] = data["mm_charges"].clone().reshape(-1, 1)
             if len(data["mm_charges"]) != len(data["mm_positions"]):
                 raise ValueError("Background charge and position counts differ")
@@ -260,95 +319,139 @@ class EnvMACE(torch.nn.Module):
                 )
             if len(data["mm_atomic_numbers"]) != len(data["mm_positions"]):
                 raise ValueError("ENV species and position counts differ")
-            data["atomic_numbers"] = self.atomic_numbers[data["node_attrs"].argmax(-1)]
-            native = {k: v for k, v in data.items() if not k.startswith("mm_")}
-            # Old charge routes keep their zero/None gradient behavior during
-            # training, including optimizer state loaded from old checkpoints.
-            vacuum_only = (
-                execution_mode == "shared"
-                and len(data["mm_positions"]) == 0
-                and (not training or self.config.charge_mode == "fukui_projection")
+            embedded = len(data["mm_positions"]) > 0
+            result, base = self._energy_forward(
+                data, training=training, compute_charges=compute_charges,
+                execution_mode=execution_mode, neighbor_backend=neighbor_backend,
             )
-            if vacuum_only:
-                native["edge_index"] = qm_edges(
-                    data, float(self.r_max), self.config.near_radius
+            energy = result["energy"]
+            if compute_mm_force and embedded:
+                coordinates, names = [data["mm_positions"]], ["mm_forces"]
+                if compute_force:
+                    coordinates.insert(0, data["positions"])
+                    names.insert(0, "forces")
+                derivatives = torch.autograd.grad(
+                    energy.sum(),
+                    coordinates,
+                    create_graph=training,
+                    retain_graph=True,
                 )
-                native["shifts"] = data["positions"].new_zeros(
-                    native["edge_index"].shape[1], 3
-                )
-                native["unit_shifts"] = torch.zeros_like(native["shifts"])
-                base, h0 = self._pass(native, data, None, None, False, training)
-                reconstructed = self.charge_reconstruction(
-                    h0, data, diagnostics=compute_charges
-                )
-                q0 = reconstructed["charges"]
-                electrostatic = torch.zeros_like(base["energy"])
-                residual = torch.zeros_like(base["energy"])
-            else:
-                graph = build_graph(data, float(self.r_max), self.config)
-                keep = (graph.edge_index < graph.qm_count).all(0)
-                native["edge_index"] = graph.edge_index[:, keep]
-                native["shifts"] = data["positions"].new_zeros(int(keep.sum()), 3)
-                native["unit_shifts"] = torch.zeros_like(native["shifts"])
-                phi, far = potentials(data, self.config)
-                far = far / self.field_units
-                if execution_mode == "shared":
-                    base, h0, he = run_shared_passes(
-                        self, native, data, graph, far, training
-                    )
-                else:
-                    base, h0 = self._pass(native, data, graph, far, False, training)
-                    _, he = self._pass(native, data, graph, far, True, training)
-                charge_geometry = (
-                    self.charge_reconstruction.prepare(data)
-                    if self.config.charge_mode
-                    in ("charge_projection", "iterative_response")
-                    else None
-                )
-                q0 = self.charge_reconstruction(h0, data, geometry=charge_geometry)[
-                    "charges"
-                ]
-                reconstructed = self.charge_reconstruction(
-                    he,
-                    data,
-                    diagnostics=compute_charges,
-                    potential=phi,
-                    geometry=charge_geometry,
-                )
-                q = reconstructed["charges"]
-                n = len(data["ptr"]) - 1
-                electrostatic = sum_nodes(q * phi, data["batch"], n)
-                local_residual = self.response_readout(
-                    he, q, far
-                ) - self.response_readout(h0, q0, torch.zeros_like(far))
-                residual = sum_nodes(local_residual, data["batch"], n)
-            energy = base["energy"] + electrostatic + residual
-            result = dict(
-                energy=energy,
-                energy_vacuum=base["energy"],
-                energy_electrostatic=electrostatic,
-                energy_residual=residual,
-                **reconstructed,
-            )
-            if compute_vacuum_charges:
-                result["charges_vacuum"] = q0
-            if compute_force:
+                result.update({name: -g for name, g in zip(names, derivatives)})
+            elif compute_force:
                 result["forces"] = -torch.autograd.grad(
                     energy.sum(),
                     data["positions"],
                     create_graph=training,
                     retain_graph=True,
                 )[0]
+            if compute_mm_force and not embedded:
+                result["mm_forces"] = data["mm_positions"].new_empty((0, 3))
             if compute_response:
-                v = (
-                    data["mm_charges"].new_empty(0)
-                    if vacuum_only
-                    else torch.autograd.grad(
+                result["response_potential"] = (
+                    torch.autograd.grad(
                         energy.sum(),
                         data["mm_charges"],
                         create_graph=training,
                         retain_graph=True,
-                    )[0]
+                    )[0].flatten()
+                    if embedded
+                    else data["mm_charges"].new_empty(0)
                 )
-                result["response_potential"] = v.flatten()
-            return result
+            return result, base
+
+    @staticmethod
+    def _vacuum_data(data):
+        vacuum = dict(data)
+        vacuum["mm_positions"] = data["mm_positions"].new_empty((0, 3))
+        vacuum["mm_charges"] = data["mm_charges"].new_empty((0, 1))
+        vacuum["mm_atomic_numbers"] = torch.empty(
+            0, device=data["positions"].device, dtype=torch.long
+        )
+        vacuum["mm_count"] = torch.zeros_like(data["mm_count"])
+        return vacuum
+
+    def forward(
+        self,
+        data,
+        training=False,
+        compute_force=True,
+        compute_response=False,
+        compute_charges=False,
+        compute_vacuum_charges=False,
+        execution_mode="optimized",
+        neighbor_backend="reference",
+        *,
+        compute_mm_force=False,
+    ):
+        if execution_mode not in ("reference", "optimized"):
+            raise ValueError("execution_mode must be reference or optimized")
+        result, _ = self._forward_once(
+            data,
+            training,
+            compute_force,
+            compute_response,
+            compute_charges,
+            execution_mode=execution_mode,
+            neighbor_backend=neighbor_backend,
+            compute_mm_force=compute_mm_force,
+        )
+        if compute_vacuum_charges:
+            result["charges_vacuum"] = (
+                self._forward_once(
+                    self._vacuum_data(data),
+                    training,
+                    compute_force=False,
+                    execution_mode=execution_mode,
+                    neighbor_backend=neighbor_backend,
+                )[0]["charges"]
+                if len(data["mm_positions"])
+                else result["charges"]
+            )
+        return result
+
+    def compare_environment(
+        self,
+        data,
+        compute_charges=True,
+        execution_mode="optimized",
+        neighbor_backend="reference",
+    ):
+        """Two ordinary conditions, same QM geometry/Q/parameters; no force split.
+
+        The response includes energy_ele. Subtract reference-free native terms
+        in double precision, before adding the explicit cross interaction.
+        """
+        if execution_mode not in ("reference", "optimized"):
+            raise ValueError("execution_mode must be reference or optimized")
+        embedded, native_embedded = self._forward_once(
+            data,
+            compute_force=False,
+            compute_charges=compute_charges,
+            execution_mode=execution_mode,
+            neighbor_backend=neighbor_backend,
+        )
+        if len(data["mm_positions"]):
+            vacuum, native_vacuum = self._forward_once(
+                self._vacuum_data(data),
+                compute_force=False,
+                compute_charges=compute_charges,
+                execution_mode=execution_mode,
+                neighbor_backend=neighbor_backend,
+            )
+            response = (
+                native_embedded["interaction_energy"].double()
+                - native_vacuum["interaction_energy"].double()
+                + embedded["energy_ele"].double()
+            )
+        else:
+            vacuum = embedded
+            response = embedded["energy"].new_zeros(
+                embedded["energy"].shape, dtype=torch.float64
+            )
+        return dict(
+            **embedded,
+            energy_vac=vacuum["energy"],
+            energy_response=response,
+            charges_vacuum=vacuum["charges"],
+            delta_charges=embedded["charges"] - vacuum["charges"],
+        )
